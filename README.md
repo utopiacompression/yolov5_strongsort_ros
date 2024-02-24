@@ -1,22 +1,6 @@
 
-
-
-![ezgif com-gif-maker](https://user-images.githubusercontent.com/98438319/205487635-836155cf-2288-40a1-a02f-8e730c787520.gif)
-
-
-
-
-
-
-
-# yolov7_StrongSORT_ROS
-Integration of  "Yolov7 StrongSort" with ROS for real time object tracking
-
-
-# Requirements
-Ubuntu 18.04
-
-ROS Melodic
+# yolov5_StrongSORT_ROS
+Integration of  "Yolov5 StrongSort" with ROS for real time object tracking
 
 
 # Installation
@@ -25,7 +9,7 @@ Clone the repository recursively:
 
 ```
 cd catkin_workspace/src
-git clone --recurse-submodules https://github.com/PardisTaghavi/yolov7_strongsort_ros.git
+git clone --recurse-submodules https://github.com/utopiacompression/yolov5_strongsort_ros.git
 ```
 or if you cloned the repo without --recurse-submodules
 ```
