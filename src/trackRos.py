@@ -16,26 +16,36 @@ from pathlib import Path
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+import pandas as pd
+from collections import Counter
 
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # yolov5 strongsort root directory
+# ROOT = FILE.parents[0]  # yolov5 strongsort root directory
+# print(type(FILE.parents[0]))
+ROOT = Path("/home/unreal/projects/Elijah/StrongSort/catkin_workspace/src/yolov7_strongsort_ros/src/Yolov7_StrongSORT_OSNet")
 WEIGHTS = ROOT / 'weights'
 
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-if str(ROOT / 'yolov7') not in sys.path:
-    sys.path.append(str(ROOT / 'yolov7'))  # add yolov5 ROOT to PATH
+if str(ROOT / 'yolov5') not in sys.path:
+    sys.path.append(str(ROOT / 'yolov5'))  # add yolov5 ROOT to PATH
 if str(ROOT / 'strong_sort') not in sys.path:
     sys.path.append(str(ROOT / 'strong_sort'))  # add strong_sort ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+print(ROOT)
 
-from yolov7.models.experimental import attempt_load
-from yolov7.utils.datasets import LoadImages, LoadStreams
-from yolov7.utils.general import (check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
+from yolov5.models.common import DetectMultiBackend
+try:
+    from yolov5.utils.dataloaders import VID_FORMATS, LoadImages, LoadStreams
+except:
+    import sys
+    sys.path.append('yolov5/utils')
+    from dataloaders import VID_FORMATS, LoadImages, LoadStreams
+from yolov5.utils.general import (check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
                                   check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr, check_file)
-from yolov7.utils.torch_utils import select_device, time_synchronized
-from yolov7.utils.plots import plot_one_box
+from yolov5.utils.torch_utils import select_device, time_sync
+from yolov5.utils.plots import Annotator, colors, save_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
 from PIL import Image as IM
@@ -45,7 +55,7 @@ import rospy
 import ros_numpy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header
-from utils.datasets import letterbox
+from yolov5.utils.augmentations import letterbox
 
 #VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
 
@@ -54,16 +64,16 @@ from utils.datasets import letterbox
 class track():
     def __init__(self):
         self.source='0'
-        self.yolo_weights=WEIGHTS / 'yolov7.pt' # model.pt path(s),
+        self.yolo_weights=WEIGHTS / 'bsz_16_best.pt' # model.pt path(s),
         self.strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt' # model.pt path,
         self.config_strongsort=ROOT / 'strong_sort/configs/strong_sort.yaml'
-        self.imgsz=(640, 640) # inference size (height, width)
-        self.conf_thres=0.5  # confidence threshold
-        self.iou_thres=0.65  # NMS IOU threshold
+        self.imgsz=(2048, 2048) # inference size (height, width)
+        self.conf_thres=0.4  # confidence threshold
+        self.iou_thres=0.4  # NMS IOU threshold
         self.max_det=1000 # maximum detections per image
         self.device="0" # cuda device, i.e. 0 or 0,1,2,3 or cpu
         self.show_vid=True  # show results
-        self.save_txt=False  # save results to *.txt
+        self.save_txt=True  # save results to *.txt
         self.save_conf=False  # save confidences in --save-txt labels
         self.save_crop=False  # save cropped prediction boxes
         self.save_vid=False  # save confidences in --save-txt labels
@@ -82,6 +92,7 @@ class track():
         self.hide_class=False  # hide IDs
         self.half=False  # use FP16 half-precision inference
         self.dnn=False  # use OpenCV DNN for ONNX inference
+        self.count=True,  # get counts of every object
         
 
         # Directories
@@ -94,25 +105,27 @@ class track():
         else:  # multiple models after --yolo_weights
             exp_name = 'ensemble'
         exp_name = self.name if self.name else exp_name + "_" + self.strong_sort_weights.stem
+        self.save_dir = increment_path(Path(self.project) / exp_name, exist_ok=self.exist_ok)  # increment run
+        (self.save_dir / 'tracks' if self.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)  # make dir
        
         # Load model
         self.device = select_device(self.device)
         
         WEIGHTS.mkdir(parents=True, exist_ok=True)
-        self.model = attempt_load(Path(self.yolo_weights), map_location=self.device)  # load FP32 model
+        self.model = DetectMultiBackend(self.yolo_weights, device=self.device, dnn=self.dnn, data=None, fp16=self.half)
         
         self.names, = self.model.names,
         self.colors = [[random.randint(0, 255) for _ in range(3)] for _ in self.names]
 
-        self.stride = self.model.stride.max()  # model stride
-        self.imgsz = check_img_size(self.imgsz[0], s=self.stride.cpu().numpy())  # check image size
+        self.stride = self.model.stride  # model stride
+        self.imgsz = check_img_size(self.imgsz[0], s=self.stride)  # check image size
         cudnn.benchmark = True
 
         # Run inference - uncomment to check if model is runnin properly
         #if self.device.type != "cpu" :
         #    self.model(torch.zeros(1, 3, 640, 640).to(self.device).type_as(next(self.model.parameters())))  # run once
         #    print("interference is running")
-        self.image_sub = rospy.Subscriber("/kitti/camera_color_right/image_raw", Image, self.camera_callback, queue_size=1, buff_size=2**24) #"/camera_fr/image_raw"
+        self.image_sub = rospy.Subscriber("/image_raw_tr0", Image, self.camera_callback, queue_size=1, buff_size=2**24) #"/camera_fr/image_raw"
         self.trackPublish = rospy.Publisher("trackResult", Image, queue_size=1)  
 
         # initialize StrongSORT
@@ -122,6 +135,8 @@ class track():
         # Create as many strong sort instances as there are video sources
         self.nr_sources = 1
         
+        txt_path = [None] * self.nr_sources
+
         #self.strongsort_list = []
         #for i in range(self.nr_sources):
         self.strongsort_list= StrongSORT(
@@ -136,7 +151,8 @@ class track():
                 mc_lambda=self.cfg.STRONGSORT.MC_LAMBDA,
                 ema_alpha=self.cfg.STRONGSORT.EMA_ALPHA,
             )
-        
+    
+
         self.strongsort_list.model.warmup()
         rate=rospy.Rate(50)
         rate.sleep()
@@ -185,9 +201,9 @@ class track():
         curr_frames, prev_frames = [None] * self.nr_sources, [None] * self.nr_sources
        
         s = ''
-        t1 = time_synchronized()
+        t1 = time_sync()
         
-        t2 = time_synchronized()
+        t2 = time_sync()
         dt[0] += t2 - t1
 
         # Inference
@@ -195,12 +211,12 @@ class track():
             pred = self.model(img)
             #print("pred after yolov7", pred[0])
             print(" \n")
-            t3 = time_synchronized()
+            t3 = time_sync()
             dt[1] += t3 - t2
 
             # Apply NMS
-            pred = non_max_suppression(pred[0], self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms)
-            dt[2] += time_synchronized() - t3
+            pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms)
+            dt[2] += time_sync() - t3
             #print("---pred after NMS---",pred)
 
             #show_vid=False
@@ -212,9 +228,12 @@ class track():
                
                 curr_frames[i] = im0
 
+                txt_path = str(self.save_dir / 'tracks' / 'im')  # im.txt
+
                 s += '%gx%g ' % img.shape[2:]  # print string
 
 
+                annotator = Annotator(im0, line_width=2, pil=not ascii)
                 if self.cfg.STRONGSORT.ECC and prev_frames[i]!=None:  # camera motion compensation
                     self.strongsort_list.tracker.camera_update(prev_frames[i], curr_frames[i])
                     
@@ -236,9 +255,9 @@ class track():
                     clss = det[:, 5]
 
                     # pass detections to strongsort
-                    t4 = time_synchronized() ##############
+                    t4 = time_sync() ##############
                     outputs[i] = self.strongsort_list.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
-                    t5 = time_synchronized() ##############
+                    t5 = time_sync() ##############
                     #print("output of deepsort",outputs[i])
                     dt[3] += t5 - t4
 
@@ -250,19 +269,71 @@ class track():
                             id = output[4]
                             cls = output[5]
 
-                           
+                            if self.save_txt:
+                                # to MOT format
+                                bbox_left = output[0]
+                                bbox_top = output[1]
+                                bbox_w = output[2] - output[0]
+                                bbox_h = output[3] - output[1]
+                                # Write MOT compliant results to file
+                                with open(txt_path + '.txt', 'a') as f:
+                                    f.write(('%g ' * 11 + '\n') % (start_time_seg, cls, id, bbox_left,  # MOT format
+                                                                bbox_top, bbox_w, bbox_h, -1, -1, -1, -1))
+
                             if self.show_vid:  # Add bbox to image
                                 c = int(cls)  # integer class
                                 id = int(id)  # integer id
                                 label = None if self.hide_labels else (f'{id} {self.names[c]}' if self.hide_conf else \
                                     (f'{id} {conf:.2f}' if self.hide_class else f'{id} {self.names[c]} {conf:.2f}'))
-                                plot_one_box(bboxes, im0, label=label, color=self.colors[int(cls)], line_thickness=3)
+                                annotator.box_label(bboxes, label, color=colors(c, True))
                      
                     print(f'{s}Done. YOLO:({t3 - t2:.3f}s), StrongSORT:({t5 - t4:.3f}s)')
 
                 else:
                     self.strongsort_list.increment_ages()
                     print('No detections')
+
+                if self.count:
+                    itemDict={}
+                    ## NOTE: this works only if save-txt is true
+                    try:
+                        df = pd.read_csv(txt_path +'.txt' , header=None, delim_whitespace=True)
+                        df = df.iloc[:,0:3]
+                        df.columns=["frameid" ,"class","trackid"]
+                        df = df[['class','trackid']]
+                        df = (df.groupby('trackid')['class']
+                                .apply(list)
+                                .apply(lambda x:sorted(x))
+                                ).reset_index()
+
+                        df.columns = ["trackid","class"]
+                        df['class']=df['class'].apply(lambda x: Counter(x).most_common(1)[0][0])
+                        vc = df['class'].value_counts()
+                        vc = dict(vc)
+
+                        vc2 = {}
+                        for key, val in enumerate(self.names):
+                            vc2[key] = val
+                        itemDict = dict((vc2[key], value) for (key, value) in vc.items())
+                        itemDict  = dict(sorted(itemDict.items(), key=lambda item: item[0]))
+                        # print(itemDict)
+
+                    except:
+                        pass
+
+                    if self.save_txt:
+                        ## overlay
+                        display = im0.copy()
+                        h, w = im0.shape[0], im0.shape[1]
+                        x1 = 10
+                        y1 = 10
+                        x2 = 10
+                        y2 = 70
+
+                        txt_size = cv2.getTextSize(str(itemDict), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+                        cv2.rectangle(im0, (x1, y1 + 1), (txt_size[0] * 2, y2),(0, 0, 0),-1)
+                        cv2.putText(im0, '{}'.format(itemDict), (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX,0.7, (210, 210, 210), 2)
+                        cv2.addWeighted(im0, 0.7, display, 1 - 0.7, 0, im0)
 
                 # Stream results
                 rviz=True
